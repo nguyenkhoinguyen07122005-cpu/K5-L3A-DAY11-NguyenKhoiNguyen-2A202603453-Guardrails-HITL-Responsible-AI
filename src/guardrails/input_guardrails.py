@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,8 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+MAX_INPUT_CHARS = 4000  # câu hỏi ngân hàng thật không dài hơn mức này
 
 
 # ============================================================
@@ -42,8 +45,92 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_INVISIBLE_CHARS = dict.fromkeys(
+    map(ord, "​‌‍‎‏⁠⁡⁢⁣⁤﻿­᠎")
+)
+# Ký tự "homoglyph" hay gặp (Cyrillic/Greek trông giống Latin) -> Latin
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "і": "i",
+    "ѕ": "s", "ј": "j", "ԁ": "d", "ɡ": "g", "ο": "o", "ν": "v", "ρ": "p", "α": "a",
+})
+
+
+def normalize_text(text: str) -> str:
+    """Canonicalize Unicode so that obfuscated payloads look like plain text.
+
+    - NFKC: full-width / compatibility chars  -> ASCII  (ｉｇｎｏｒｅ -> ignore)
+    - remove zero-width / bidi / soft-hyphen characters
+    - map common Cyrillic/Greek look-alikes to Latin
+    - drop remaining control chars, collapse whitespace
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_INVISIBLE_CHARS).translate(_HOMOGLYPHS)
+    text = "".join(
+        ch for ch in text
+        if ch in "\n\t " or unicodedata.category(ch) not in ("Cc", "Cf")
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_accents(text: str) -> str:
+    """'tài khoản' -> 'tai khoan' (so Vietnamese topics match with/without accents)."""
+    text = unicodedata.normalize("NFD", text.replace("đ", "d").replace("Đ", "D"))
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+
+
+# Signal 1: cụm lệnh ghi đè chỉ dẫn / đóng vai / đòi lộ system prompt (EN + VI)
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+|any\s+|the\s+)?(previous|above|prior|earlier|your)?\s*(instructions?|rules?|guidelines?|directives?)",
+    r"disregard\s+(all\s+|any\s+|the\s+)?(previous|above|prior|your)?\s*(instructions?|rules?|guidelines?)",
+    r"forget\s+(all\s+|everything\s+|your\s+)?(previous\s+|prior\s+)?(instructions?|rules?|prompt)",
+    r"override\s+(your\s+|the\s+)?(system\s+)?(prompt|instructions?|rules?|safety)",
+    r"you\s+are\s+now\b",
+    r"\bsystem\s+(prompt|message|instructions?)\b",
+    r"\b(reveal|show|print|repeat|display|output|leak|expose|tell\s+me)\s+(me\s+)?(all\s+)?(of\s+)?(your|the)\s+(hidden\s+|internal\s+|initial\s+|original\s+)?(instructions?|prompt|rules|configuration|config|secrets?)",
+    r"pretend\s+(that\s+)?(you\s+are|you're|to\s+be)",
+    r"act\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|evil|dan\b)",
+    r"\bDAN\b|do\s+anything\s+now|developer\s+mode|jailbreak",
+    r"\b(without|no)\s+(any\s+)?(restrictions?|filters?|limitations?|guardrails?)\b",
+    # SQL / command injection thường gặp (edge case)
+    r"\b(drop|truncate|delete\s+from)\s+(table|database)\b|\bunion\s+select\b|;\s*--",
+    # Vietnamese
+    r"b[oỏ]\s*qua\s+(m[oọ]i\s+|t[aấ]t\s+c[aả]\s+)?(h[uư][oơ]ng\s*d[aẫ]n|ch[iỉ]\s*th[iị]|quy\s*t[aắ]c)",
+    r"qu[eê]n\s+(m[oọ]i\s+|h[eế]t\s+)?(h[uư][oơ]ng\s*d[aẫ]n|ch[iỉ]\s*th[iị]|quy\s*t[aắ]c)",
+    r"ti[eế]t\s*l[oộ]\s+(m[aậ]t\s*kh[aẩ]u|api|system\s*prompt|th[oô]ng\s*tin\s*n[oộ]i\s*b[oộ])",
+    r"b[aạ]n\s+l[aà]\s+(b[aâ]y\s+gi[oờ]|DAN)",
+]
+
+# Signal 2: yêu cầu lấy credential nội bộ (khác với "quên mật khẩu của tôi")
+SECRET_EXTRACTION_PATTERNS = [
+    r"\b(admin|root|internal|system|service)\s+(password|passwd|credentials?|api\s*key|token)\b",
+    r"\b(vinbank|your|the)\s+(api\s*key|db\s*host|database\s*(host|password|connection)|connection\s*string)\b",
+    r"\bdb\.vinbank\.internal\b|\bsk-vinbank\b|\badmin123\b",
+    r"\b(reveal|disclose|leak|dump|exfiltrate|encode|translate|base64|rot13)\b.{0,60}\b(password|credentials?|api\s*key|secret|internal\s+note)",
+    r"\b(password|credentials?|api\s*key|secret)\b.{0,40}\b(reveal|disclose|leak|dump|exfiltrate|base64|rot13)\b",
+    r"\b(fill\s+in\s+the\s+blank|complete\s+the\s+sentence)\b.{0,80}\b(password|api\s*key|secret|credentials?)",
+    r"m[aậ]t\s*kh[aẩ]u\s+(admin|qu[aả]n\s*tr[iị]|h[eệ]\s*th[oố]ng)",
+]
+
+# Signal 3: sau khi bỏ ký tự phân tách ("i-g-n-o-r-e", "ignore_previous...") vẫn khớp cụm lõi
+_SQUASHED_PHRASES = (
+    "ignoreallpreviousinstructions", "ignorepreviousinstructions", "ignoreallinstructions",
+    "ignoreyourinstructions", "ignoretheaboveinstructions", "disregardpreviousinstructions",
+    "forgetyourinstructions", "revealyourinstructions", "revealyourprompt",
+    "revealthesystemprompt", "showmethesystemprompt", "systemprompt", "youarenow",
+    "pretendyouare", "actasanunrestricted", "actasunrestricted", "developermode",
+)
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
+
+    Layered signals (regex is one signal, not the whole boundary):
+      1. normalize Unicode (zero-width, full-width, homoglyph) then regex override phrases
+      2. regex for credential / secret extraction requests
+      3. "squashed" check (strip every non-alphanumeric) to catch i.g.n.o.r.e style splits
+
+    A benign request to *summarize* external data (email/RAG) is allowed: being
+    external is not by itself a reason to block — only an embedded instruction is.
 
     Args:
         user_input: The user's message
@@ -51,15 +138,19 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    text = normalize_text(user_input)
+    if not text:
+        return "ALLOW"
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    for pattern in INJECTION_PATTERNS + SECRET_EXTRACTION_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
             return "BLOCK"
+        if re.search(pattern, strip_accents(text), re.IGNORECASE):
+            return "BLOCK"
+
+    squashed = re.sub(r"[^a-z0-9]", "", strip_accents(text).lower())
+    if any(phrase in squashed for phrase in _SQUASHED_PHRASES):
+        return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +175,21 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    # Chuẩn hoá + bỏ dấu để "tài khoản" khớp "tai khoan"
+    input_lower = strip_accents(normalize_text(user_input)).lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def _has(topic: str) -> bool:
+        # \b ở đầu từ: "atm" không khớp "treatment", "kill" không khớp "skill"
+        return re.search(r"\b" + re.escape(topic), input_lower) is not None
 
-    pass  # Replace with your implementation
+    # 1. Chủ đề cấm -> BLOCK
+    if any(_has(topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+    # 2. Không có chủ đề ngân hàng nào -> BLOCK (off-topic)
+    if not any(_has(topic) for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+    # 3. Còn lại -> ALLOW
+    return "ALLOW"
 
 
 # ============================================================
@@ -112,6 +210,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_block_reason: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +243,33 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 0. Input quá dài (cost / flooding / giấu payload) -> chặn
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            self.last_block_reason = "too_long"
+            return self._block_response(
+                "Your message is too long. Please send a shorter banking question."
+            )
 
-        pass  # Replace with your implementation
+        # 1. Prompt injection
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_block_reason = "injection"
+            return self._block_response(
+                "I cannot process that request. I only help with VinBank banking questions."
+            )
+
+        # 2. Chủ đề (off-topic / chủ đề cấm / rỗng)
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_block_reason = "topic"
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+
+        # 3. Hợp lệ -> cho qua
+        self.last_block_reason = None
+        return None
 
 
 # ============================================================
